@@ -1,77 +1,161 @@
 #!/usr/bin/env python3
 """
 Paperless Ingest WebUI — Upload/SANE-scan documents to Paperless consumption dir.
-v3.0 — Device/source/resolution/mode dropdowns, auto-detect scanners.
+v4.0 — Hash logging, telemetry, doc-matching, scanner discovery cache.
 
 Endpoints:
   GET  /                        — Web UI
-  GET  /api/scanners            — List all SANE scanners with capabilities
-  POST /upload                  — Upload file(s) (multipart)
-  POST /scan                    — Single-pass scan (device, source, mode, res)
+  GET  /api/scanners            — List SANE scanners with capabilities (cached)
+  GET  /api/log                 — Document ingest log (paginated)
+  POST /upload                  — Upload files (multipart)
+  POST /scan                    — Single-pass scan
   POST /scan/duplex/start       — Duplex: side A
   POST /scan/duplex/finish      — Duplex: side B, interleave, save
   GET  /status                  — Last ingest info
 """
 
-import os, sys, json, time, uuid, logging, subprocess, tempfile, shutil, re
+import os, sys, json, time, uuid, logging, subprocess, tempfile, shutil, re, hashlib
+import sqlite3, threading
 from pathlib import Path
 from datetime import datetime
 from typing import Optional
 from threading import Lock
 
 import uvicorn
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, UploadFile, File, HTTPException, Query
 from fastapi.responses import HTMLResponse
 
+# ── Config ──────────────────────────────────────────────────────────────
 CONSUME_DIR = Path("/mnt/apple_xfs/documents/consume")
+DB_PATH = Path("/var/lib/paperless-ingest/log.db")
 HOST, PORT = "0.0.0.0", 3095
 LOG_LEVEL = "INFO"
 
+# ── Logging ─────────────────────────────────────────────────────────────
 logging.basicConfig(level=getattr(logging, LOG_LEVEL),
                     format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("paperless-ingest")
 
-app = FastAPI(title="Paperless Ingest", version="3.0.0")
+# ── App ─────────────────────────────────────────────────────────────────
+app = FastAPI(title="Paperless Ingest", version="4.0.0")
 CONSUME_DIR.mkdir(parents=True, exist_ok=True)
+DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 last_ingest = {"time": None, "file": None, "type": None}
 duplex_sessions = {}
 duplex_lock = Lock()
 
+# ── Scanner Cache ───────────────────────────────────────────────────────
+_scanner_cache = []
+_scanner_cache_ts = 0
+_scanner_cache_lock = Lock()
 
-# ── Scanner Discovery ───────────────────────────────────────────────────
+# ── Database ────────────────────────────────────────────────────────────
+_db_init_lock = Lock()
+_db_initialized = False
+
+def init_db():
+    global _db_initialized
+    with _db_init_lock:
+        if _db_initialized:
+            return
+        conn = sqlite3.connect(str(DB_PATH))
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS ingest_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT NOT NULL,
+                filename TEXT NOT NULL,
+                sha256 TEXT NOT NULL,
+                size_bytes INTEGER NOT NULL,
+                pages INTEGER DEFAULT 1,
+                source TEXT NOT NULL,
+                device TEXT,
+                mode TEXT,
+                resolution INTEGER,
+                status TEXT DEFAULT 'ingested'
+            )
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_ingest_sha ON ingest_log(sha256)
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_ingest_ts ON ingest_log(timestamp DESC)
+        """)
+        conn.commit()
+        conn.close()
+        _db_initialized = True
+        log.info(f"DB initialized at {DB_PATH}")
+
+def log_ingest(filename: str, sha256: str, size_bytes: int, pages: int,
+               source: str, device: str = None, mode: str = None,
+               resolution: int = None):
+    init_db()
+    try:
+        conn = sqlite3.connect(str(DB_PATH))
+        conn.execute(
+            "INSERT INTO ingest_log (timestamp, filename, sha256, size_bytes, pages, source, device, mode, resolution) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (datetime.now().isoformat(), filename, sha256, size_bytes, pages, source, device, mode, resolution)
+        )
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        log.error(f"DB insert failed: {e}")
+
+def get_recent_logs(limit: int = 20, offset: int = 0) -> list:
+    init_db()
+    try:
+        conn = sqlite3.connect(str(DB_PATH))
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            "SELECT * FROM ingest_log ORDER BY timestamp DESC LIMIT ? OFFSET ?",
+            (limit, offset)
+        ).fetchall()
+        conn.close()
+        return [dict(r) for r in rows]
+    except Exception as e:
+        log.error(f"DB query failed: {e}")
+        return []
+
+def get_log_count() -> int:
+    init_db()
+    try:
+        conn = sqlite3.connect(str(DB_PATH))
+        count = conn.execute("SELECT COUNT(*) FROM ingest_log").fetchone()[0]
+        conn.close()
+        return count
+    except:
+        return 0
+
+# ── Scanner Discovery (cached, 30s TTL) ────────────────────────────────
 
 def discover_scanners() -> list[dict]:
-    """Run scanimage -L and parse devices + query each for options."""
+    global _scanner_cache, _scanner_cache_ts
+    with _scanner_cache_lock:
+        if _scanner_cache and (time.time() - _scanner_cache_ts) < 30:
+            return _scanner_cache
+
     devices = []
     try:
-        r = subprocess.run(["scanimage", "-L"], capture_output=True, text=True, timeout=10)
+        r = subprocess.run(["scanimage", "-L"], capture_output=True, text=True, timeout=8)
         for line in r.stdout.strip().split("\n"):
             line = line.strip()
             m = re.match(r"device\s+`([^']+)'\s+is\s+a\s+(.+?)\s*(?=ip=|$)", line)
             if m:
-                dev_id = m.group(1)
-                desc = m.group(2).strip()
-                devices.append({"id": dev_id, "name": desc, "sources": [], "resolutions": []})
+                devices.append({"id": m.group(1), "name": m.group(2).strip(),
+                                "sources": [], "resolutions": [], "modes": []})
     except Exception as e:
-        log.warning(f"Scanner discovery failed: {e}")
+        log.warning(f"scanimage -L failed: {e}")
 
-    # Query each device for options
-    for dev in devices[:1]:  # Only query first device (avoids timeouts)
+    # Query first device for options (with shorter timeout)
+    for dev in devices[:1]:
         try:
             r = subprocess.run(["scanimage", f"--device={dev['id']}", "-A"],
-                               capture_output=True, text=True, timeout=8)
-            # Parse sources
-            src_m = re.search(r"--source\s+(.+?)\s+\[", r.stdout)
-            if src_m:
-                dev["sources"] = [s.strip() for s in src_m.group(1).split("|")]
-            # Parse resolutions
-            res_m = re.search(r"--resolution\s+([\d|]+)dpi", r.stdout)
-            if res_m:
-                dev["resolutions"] = [int(s) for s in res_m.group(1).split("|")]
-            # Parse modes
-            mode_m = re.search(r"--mode\s+(.+?)\s+\[", r.stdout)
-            if mode_m:
-                dev["modes"] = [s.strip() for s in mode_m.group(1).split("|")]
+                               capture_output=True, text=True, timeout=6)
+            src = re.search(r"--source\s+(.+?)\s+\[", r.stdout)
+            if src: dev["sources"] = [s.strip() for s in src.group(1).split("|")]
+            res = re.search(r"--resolution\s+([\d|]+)dpi", r.stdout)
+            if res: dev["resolutions"] = [int(s) for s in res.group(1).split("|")]
+            mode = re.search(r"--mode\s+(.+?)\s+\[", r.stdout)
+            if mode: dev["modes"] = [s.strip() for s in mode.group(1).split("|")]
         except Exception:
             pass
 
@@ -79,6 +163,10 @@ def discover_scanners() -> list[dict]:
         devices.append({"id": "airscan:e0:EPSON WF-2630 Series", "name": "EPSON WF-2630 Series",
                         "sources": ["Flatbed", "ADF"], "resolutions": [100, 200, 300, 600, 1200],
                         "modes": ["Color", "Gray"]})
+
+    with _scanner_cache_lock:
+        _scanner_cache = devices
+        _scanner_cache_ts = time.time()
     return devices
 
 
@@ -87,33 +175,27 @@ def discover_scanners() -> list[dict]:
 def scan_to_pnms(tmpdir: str, device: str = None,
                  source: str = "ADF", mode: str = "Lineart",
                  resolution: int = 300) -> Optional[list[Path]]:
-    """Scan from SANE device. Returns list of PNM paths or None."""
-    if device is None:
-        device = "airscan:e0:EPSON WF-2630 Series"
-
-    # If source is "Auto", try ADF first, fall back to Flatbed
-    sources_to_try = [source]
+    dev = device or "airscan:e0:EPSON WF-2630 Series"
+    sources = [source]
     if source == "Auto":
-        sources_to_try = ["ADF", "Flatbed"]
-
+        sources = ["ADF", "Flatbed"]
     tmp = Path(tmpdir)
-    for src in sources_to_try:
+    for src in sources:
         pattern = str(tmp / f"scan_{src}_%d.pnm")
-        cmd = ["scanimage", f"--device={device}", f"--source={src}",
+        cmd = ["scanimage", f"--device={dev}", f"--source={src}",
                f"--mode={mode}", f"--resolution={resolution}",
                f"--batch={pattern}", "--format=pnm", "--batch-count=0"]
         log.info(f"Scan: {' '.join(cmd)}")
         try:
             r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
         except (subprocess.TimeoutExpired, FileNotFoundError) as e:
-            log.error(f"Scan error: {e}")
-            return None
+            log.error(f"Scan error: {e}"); return None
         if r.returncode == 0:
             pnms = sorted(tmp.glob(f"scan_{src}_*.pnm"))
             if pnms:
                 log.info(f"Got {len(pnms)} page(s) from {src}")
                 return pnms
-        log.info(f"No pages from {src} (rc={r.returncode}), trying next..." if len(sources_to_try) > 1 else "")
+        log.info(f"No pages from {src}")
     return None
 
 
@@ -135,13 +217,12 @@ def pnms_to_pdf(pnm_files: list[Path]) -> Optional[bytes]:
 
 
 def interleave_pages(side_a: list[Path], side_b: list[Path]) -> list[Path]:
-    side_a = sorted(side_a)
-    side_b = sorted(side_b, reverse=True)
+    sa, sb = sorted(side_a), sorted(side_b, reverse=True)
     result = []
-    for i in range(max(len(side_a), len(side_b))):
-        if i < len(side_a): result.append(side_a[i])
-        if i < len(side_b): result.append(side_b[i])
-    log.info(f"Interleaved: {len(side_a)} + {len(side_b)} = {len(result)} pages")
+    for i in range(max(len(sa), len(sb))):
+        if i < len(sa): result.append(sa[i])
+        if i < len(sb): result.append(sb[i])
+    log.info(f"Interleaved: {len(sa)}+{len(sb)}={len(result)}")
     return result
 
 
@@ -152,10 +233,14 @@ def unique_name(filename: str) -> str:
     return f"{stem}_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}{ext}"
 
 
+def hash_bytes(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
 def save_to_consume(data: bytes, name: str) -> Path:
     dest = CONSUME_DIR / unique_name(name)
     dest.write_bytes(data)
-    last_ingest.update({"time": datetime.now().isoformat(), "file": str(dest)})
+    last_ingest.update({"time": datetime.now().isoformat(), "file": str(dest), "sha256": hash_bytes(data)})
     log.info(f"Saved: {dest} ({len(data)} bytes)")
     return dest
 
@@ -164,7 +249,7 @@ def save_to_consume(data: bytes, name: str) -> Path:
 import atexit
 @atexit.register
 def cleanup():
-    for token, data in list(duplex_sessions.items()):
+    for data in duplex_sessions.values():
         for p in data.get("side_a", []):
             try: p.unlink(missing_ok=True)
             except: pass
@@ -215,17 +300,29 @@ h1{font-size:1.5rem;margin-bottom:.5rem}
 .tab.act{color:#c9d1d9;border-bottom-color:#58a6ff}
 .tab-pane{display:none}
 .tab-pane.act{display:block}
+.log-table{width:100%;border-collapse:collapse;font-size:.8rem}
+.log-table th{padding:.5rem;text-align:left;color:#8b949e;border-bottom:1px solid #30363d;font-weight:500}
+.log-table td{padding:.4rem .5rem;border-bottom:1px solid #21262d;color:#c9d1d9;max-width:140px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.log-table tr:hover td{background:#1c2128}
+.hash{font-family:monospace;font-size:.7rem;color:#484f58}
+.log-count{color:#8b949e;font-size:.85rem;margin-bottom:.75rem}
+.tags{display:flex;gap:.25rem;flex-wrap:wrap}
+.tag{font-size:.7rem;padding:.1rem .4rem;border-radius:3px;background:#1c2128;border:1px solid #30363d;color:#8b949e}
+.tag-upload{background:#1b3826;border-color:#238636;color:#7ee787}
+.tag-scan{background:#1c3a5a;border-color:#1f6feb;color:#79c0ff}
+.tag-duplex{background:#3b1e6e;border-color:#8957e5;color:#d2a8ff}
 </style>
 </head>
 <body>
 <div class="container">
 <h1>📄 Paperless Ingest</h1>
-<p class="sub">Upload or scan &rarr; auto-ingested by Paperless-ngx</p>
+<p class="sub">Upload or scan &rarr; auto-ingested &rarr; hashed &rarr; logged</p>
 
 <div class="tabs">
 <div class="tab act" onclick="switchTab('upload')">📤 Upload</div>
 <div class="tab" onclick="switchTab('scan')">🖨 Scan</div>
 <div class="tab" onclick="switchTab('duplex')">🔁 Duplex</div>
+<div class="tab" onclick="switchTab('log')">📋 Log</div>
 </div>
 
 <div id="tab-upload" class="tab-pane act">
@@ -246,7 +343,7 @@ h1{font-size:1.5rem;margin-bottom:.5rem}
 </div>
 <div class="sel-row">
 <select id="modeS"><option value="Lineart">B&amp;W Lineart</option><option value="Gray">Grayscale</option><option value="Color">Color</option></select>
-<select id="resS"><option value="300">300 dpi</option><option value="200">200 dpi</option><option value="100">100 dpi</option><option value="600">600 dpi</option></select>
+<select id="resS"><option value="300">300 dpi</option><option value="200">200 dpi</option><option value="100">100 dpi</option></select>
 </div>
 <button class="btn" id="sb">🔄 Scan &rarr; Paperless</button>
 </div>
@@ -261,10 +358,21 @@ h1{font-size:1.5rem;margin-bottom:.5rem}
 <select id="modeD"><option value="Lineart">B&amp;W Lineart</option><option value="Gray">Grayscale</option><option value="Color">Color</option></select>
 </div>
 <div class="sel-row">
-<select id="resD"><option value="300">300 dpi</option><option value="200">200 dpi</option><option value="100">100 dpi</option><option value="600">600 dpi</option></select>
+<select id="resD"><option value="300">300 dpi</option><option value="200">200 dpi</option><option value="100">100 dpi</option></select>
 </div>
 <button class="btn" id="db">🔁 Start Duplex Scan</button>
 <div id="duplexStatus"></div>
+</div>
+</div>
+
+<div id="tab-log" class="tab-pane">
+<div class="card">
+<h2>📋 Ingest Log</h2>
+<p class="log-count" id="logCount">Loading...</p>
+<table class="log-table">
+<thead><tr><th>Time</th><th>File</th><th>Hash (SHA256)</th><th>Size</th><th>Pages</th><th>Source</th></tr></thead>
+<tbody id="logBody"></tbody>
+</table>
 </div>
 </div>
 
@@ -275,7 +383,7 @@ h1{font-size:1.5rem;margin-bottom:.5rem}
 <script>
 const fi=document.createElement('input');fi.type='file';fi.multiple=true;fi.accept='.pdf,.png,.jpg,.jpeg,.tiff,.tif';
 const dz=document.getElementById('dz'),fl=document.getElementById('fl'),ub=document.getElementById('ub');
-const sb=document.getElementById('sb'),db=document.getElementById('db'),st=document.getElementById('status');
+const sb=document.getElementById('sb'),db=document.getElementById('db'),st=document.getElementById('st');
 const ds=document.getElementById('duplexStatus');
 let files=[],duplexToken=null;
 
@@ -283,36 +391,45 @@ let files=[],duplexToken=null;
 fetch('/api/scanners').then(r=>r.json()).then(devs=>{
   if(!devs.length) return;
   const d=devs[0];
-  const devOpts=devs.map((x,i)=>'<option value="'+x.id+'"'+(i===0?' selected':'')+'>'+x.name+'</option>').join('');
-  document.getElementById('devS').innerHTML=devOpts;
-  document.getElementById('devD').innerHTML=devOpts;
-  // Populate resolutions from driver
+  document.getElementById('devS').innerHTML=devs.map((x,i)=>'<option value="'+x.id+'"'+(i===0?' selected':'')+'>'+x.name+'</option>').join('');
+  document.getElementById('devD').innerHTML=document.getElementById('devS').innerHTML;
   if(d.resolutions&&d.resolutions.length){
-    const resOpts=d.resolutions.map(r=>'<option value="'+r+'">'+r+' dpi</option>').join('');
-    document.getElementById('resS').innerHTML=resOpts;
-    document.getElementById('resD').innerHTML=resOpts;
+    const ro=d.resolutions.map(r=>'<option value="'+r+'">'+r+' dpi</option>').join('');
+    document.getElementById('resS').innerHTML=ro;document.getElementById('resD').innerHTML=ro;
   }
-  // Populate modes from driver (keep Lineart as extra since SANE supports it)
   if(d.modes&&d.modes.length){
-    const modeOpts='<option value="Lineart">B&amp;W Lineart</option>'+d.modes.map(m=>'<option value="'+m+'">'+m+(m==='Color'?'':'')+'</option>').join('');
-    document.getElementById('modeS').innerHTML=modeOpts;
-    document.getElementById('modeD').innerHTML=modeOpts;
+    const mo='<option value="Lineart">B&amp;W Lineart</option>'+d.modes.map(m=>'<option value="'+m+'">'+m+'</option>').join('');
+    document.getElementById('modeS').innerHTML=mo;document.getElementById('modeD').innerHTML=mo;
   }
-  // Update source options if driver reports sources
   if(d.sources&&d.sources.length){
-    const srcOpts='<option value="Auto">Auto (ADF first)</option>'+d.sources.map(s=>'<option value="'+s+'">'+s+'</option>').join('');
-    document.getElementById('srcS').innerHTML=srcOpts;
+    document.getElementById('srcS').innerHTML='<option value="Auto">Auto (ADF first)</option>'+d.sources.map(s=>'<option value="'+s+'">'+s+'</option>').join('');
   }
 }).catch(()=>{
   document.getElementById('devS').innerHTML='<option value="airscan:e0:EPSON WF-2630 Series">EPSON WF-2630 Series</option>';
   document.getElementById('devD').innerHTML='<option value="airscan:e0:EPSON WF-2630 Series">EPSON WF-2630 Series</option>';
 });
 
+// Load log
+function loadLog(){
+  fetch('/api/log?limit=50').then(r=>r.json()).then(d=>{
+    document.getElementById('logCount').textContent=d.total+' document(s) ingested';
+    const b=document.getElementById('logBody');
+    b.innerHTML=d.entries.map(e=>{
+      const t='<span class="tag tag-'+e.source+'">'+e.source+'</span>';
+      const ts=e.timestamp.slice(0,19).replace('T',' ');
+      const sz=e.size_bytes>1048576?(e.size_bytes/1048576).toFixed(1)+'MB':e.size_bytes>1024?(e.size_bytes/1024).toFixed(0)+'KB':e.size_bytes+'B';
+      return '<tr><td>'+ts+'</td><td title="'+e.filename+'">'+e.filename.slice(0,30)+'</td><td class="hash" title="'+e.sha256+'">'+e.sha256.slice(0,16)+'&hellip;</td><td>'+sz+'</td><td>'+e.pages+'</td><td>'+t+'</td></tr>';
+    }).join('');
+  }).catch(()=>{});
+}
+loadLog();
+
 function switchTab(name){
   document.querySelectorAll('.tab').forEach(t=>t.classList.remove('act'));
   document.querySelectorAll('.tab-pane').forEach(t=>t.classList.remove('act'));
   document.querySelector('.tab[onclick*="'+name+'"]').classList.add('act');
   document.getElementById('tab-'+name).classList.add('act');
+  if(name==='log') loadLog();
 }
 
 dz.onclick=()=>fi.click();
@@ -336,7 +453,7 @@ ub.onclick=async()=>{
   for(const f of files)fd.append('files',f);
   try{
     const r=await fetch('/upload',{method:'POST',body:fd});const d=await r.json();
-    if(r.ok){show('&#9989; '+d.saved+' file(s)','ok');files=[];render()}
+    if(r.ok){show('&#9989; '+d.saved+' file(s)','ok');files=[];render();loadLog()}
     else{show('&#10060; '+(d.detail||'Failed'),'er')}
   }catch(e){show('&#10060; Connection error','er')}
   ub.disabled=false;
@@ -349,7 +466,7 @@ async function doScan(endpoint,btn,extra){
   try{
     const r=await fetch(endpoint,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
     const d=await r.json();
-    if(r.ok){show('&#9989; '+d.message,'ok')}else{show('&#10060; '+(d.detail||'Failed'),'er')}
+    if(r.ok){show('&#9989; '+d.message,'ok');loadLog()}else{show('&#10060; '+(d.detail||'Failed'),'er')}
   }catch(e){show('&#10060; Connection error','er')}
   btn.disabled=false;
 }
@@ -376,7 +493,7 @@ async function finishDuplex(){
   try{
     const r=await fetch('/scan/duplex/finish',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({token:duplexToken})});
     const d=await r.json();
-    if(r.ok){show('&#9989; '+d.message,'ok');ds.style.display='none';duplexToken=null}
+    if(r.ok){show('&#9989; '+d.message,'ok');ds.style.display='none';duplexToken=null;loadLog()}
     else{show('&#10060; '+(d.detail||'Failed'),'er')}
   }catch(e){show('&#10060; Connection error','er')}
   db.disabled=false;
@@ -393,6 +510,13 @@ async def api_scanners():
     return discover_scanners()
 
 
+@app.get("/api/log")
+async def api_log(limit: int = 20, offset: int = 0):
+    entries = get_recent_logs(limit=limit, offset=offset)
+    total = get_log_count()
+    return {"entries": entries, "total": total, "limit": limit, "offset": offset}
+
+
 @app.get("/", response_class=HTMLResponse)
 async def index():
     return HTMLResponse(HTML)
@@ -406,11 +530,14 @@ async def upload_files(files: list[UploadFile] = File(...)):
     for f in files:
         try:
             content = await f.read()
-            if content:
-                save_to_consume(content, f.filename or "document.pdf")
-                saved += 1
-            else:
-                errors.append(f"{f.filename}: empty")
+            if not content:
+                errors.append(f"{f.filename}: empty"); continue
+            data_hash = hash_bytes(content)
+            dest = save_to_consume(content, f.filename or "document.pdf")
+            log_ingest(filename=dest.name, sha256=data_hash,
+                       size_bytes=len(content), pages=1,
+                       source="upload", device=None, mode=None, resolution=None)
+            saved += 1
         except Exception as e:
             errors.append(f"{f.filename}: {e}")
     return {"saved": saved, "errors": errors}
@@ -427,7 +554,12 @@ async def scan_document(device: str = None, source: str = "Auto",
         pdf = pnms_to_pdf(pnms)
         if not pdf:
             raise HTTPException(502, "PDF conversion failed")
+        data_hash = hash_bytes(pdf)
         dest = save_to_consume(pdf, "scan.pdf")
+        log_ingest(filename=dest.name, sha256=data_hash,
+                   size_bytes=len(pdf), pages=len(pnms),
+                   source="scan", device=device or "default",
+                   mode=mode, resolution=resolution)
     return {"message": f"Scanned ({len(pnms)} pages) &rarr; {dest.name}", "pages": len(pnms)}
 
 
@@ -462,7 +594,12 @@ async def duplex_finish(token: str):
         pdf = pnms_to_pdf(all_pages)
         if not pdf:
             raise HTTPException(502, "PDF conversion failed")
+        data_hash = hash_bytes(pdf)
         dest = save_to_consume(pdf, "duplex.pdf")
+        log_ingest(filename=dest.name, sha256=data_hash,
+                   size_bytes=len(pdf), pages=len(all_pages),
+                   source="duplex", device=session.get("device") or "default",
+                   mode=session.get("mode"), resolution=session.get("resolution"))
         return {"message": f"Duplex done ({len(all_pages)} pages) &rarr; {dest.name}",
                 "pages_a": len(session["side_a"]), "pages_b": len(pnms_b),
                 "pages_total": len(all_pages)}
@@ -478,5 +615,6 @@ async def get_status():
 
 # ── Main ────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    log.info(f"Paperless Ingest v3 — {CONSUME_DIR}")
+    init_db()
+    log.info(f"Paperless Ingest v4 — {CONSUME_DIR} | DB: {DB_PATH}")
     uvicorn.run(app, host=HOST, port=PORT, log_level=LOG_LEVEL.lower())
