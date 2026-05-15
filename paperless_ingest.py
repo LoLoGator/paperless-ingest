@@ -44,6 +44,76 @@ last_ingest = {"time": None, "file": None, "type": None}
 duplex_sessions = {}
 duplex_lock = Lock()
 
+# ── Scanner Status Check ───────────────────────────────────────────────
+
+def check_scanner_status(scanner_ip: str = "192.168.0.152", port: int = 443) -> dict:
+    """Query eSCL ScannerStatus endpoint. Returns state info or error dict."""
+    try:
+        r = subprocess.run(
+            ["curl", "-s", "-m", "5", f"http://{scanner_ip}:{port}/eSCL/ScannerStatus"],
+            capture_output=True, text=True, timeout=8
+        )
+        if r.returncode != 0 or not r.stdout:
+            return {"ok": False, "error": "Scanner not reachable", "help": "Check network and power"}
+
+        status_xml = r.stdout
+        state_m = re.search(r"<pwg:State>([^<]+)</pwg:State>", status_xml)
+        adf_m = re.search(r"<scan:AdfState>([^<]+)</scan:AdfState>", status_xml)
+        job_m = re.search(r"<pwg:JobState>([^<]+)</pwg:JobState>", status_xml)
+        job_uri_m = re.search(r"<pwg:JobUri>([^<]+)</pwg:JobUri>", status_xml)
+
+        state = state_m.group(1) if state_m else "Unknown"
+        adf = adf_m.group(1) if adf_m else "Unknown"
+        job_state = job_m.group(1) if job_m else None
+        job_uri = job_uri_m.group(1) if job_uri_m else None
+
+        # Map ADF states to user messages
+        adf_messages = {
+            "ScannerAdfJam": ("❌ Paper jam in ADF", "Clear the jammed paper from the ADF feeder tray and try again"),
+            "ScannerAdfEmpty": ("📄 ADF is empty", "Load paper into the ADF tray and ensure it's properly seated against the guides"),
+            "ScannerAdfLoaded": ("✅ Paper detected in ADF", None),
+            "ScannerAdfProcessing": ("🔄 ADF is processing", "Scanner is busy with a previous job, waiting..."),
+        }
+
+        msg, help_text = adf_messages.get(adf, (f"Scanner state: {adf}", None))
+
+        result = {"ok": True, "state": state, "adf": adf, "message": msg, "help": help_text}
+
+        # Auto-cancel stuck jobs
+        if job_state in ("Canceled", "Aborted", "Pending") and job_uri:
+            log.warning(f"Cancelling stuck job: {job_uri}")
+            subprocess.run(["curl", "-s", "-m", "3", "-X", "DELETE",
+                           f"http://{scanner_ip}:{port}{job_uri}"],
+                          capture_output=True, timeout=5)
+            result["cancelled_job"] = True
+
+        return result
+    except Exception as e:
+        return {"ok": False, "error": str(e), "help": "Scanner communication failed"}
+
+
+def check_scanner_before_scan() -> Optional[str]:
+    """Check scanner status before scanning. Returns error message or None."""
+    status = check_scanner_status()
+    if not status.get("ok"):
+        return f"Scanner offline: {status.get('error', 'unknown')}. {status.get('help', '')}"
+
+    adf = status.get("adf", "")
+    if "Jam" in adf:
+        return f"Paper jam detected in ADF. Clear the jammed paper and try again."
+    if "Empty" in adf or "out of documents" in adf.lower():
+        return f"ADF is empty. Load paper into the tray and try again."
+    if "Processing" in adf or "Processing" in status.get("state", ""):
+        # Scanner is busy but might be recoverable - wait and retry
+        log.info("Scanner busy, waiting 3s...")
+        time.sleep(3)
+        status = check_scanner_status()
+        if "Processing" in status.get("adf", ""):
+            return f"Scanner is busy with a previous job. Wait and try again."
+
+    return None  # Scanner is ready
+
+
 # ── Scanner Cache ───────────────────────────────────────────────────────
 _scanner_cache = []
 _scanner_cache_ts = 0
@@ -546,6 +616,11 @@ async def upload_files(files: list[UploadFile] = File(...)):
 @app.post("/scan")
 async def scan_document(device: str = None, source: str = "Auto",
                         mode: str = "Lineart", resolution: int = 300):
+    # Pre-scan check — catches jam, empty ADF, stuck jobs
+    pre_check = check_scanner_before_scan()
+    if pre_check:
+        raise HTTPException(502, detail=pre_check)
+
     with tempfile.TemporaryDirectory() as td:
         pnms = scan_to_pnms(td, device=device, source=source,
                             mode=mode, resolution=resolution)
@@ -565,6 +640,11 @@ async def scan_document(device: str = None, source: str = "Auto",
 
 @app.post("/scan/duplex/start")
 async def duplex_start(device: str = None, mode: str = "Lineart", resolution: int = 300):
+    # Pre-scan check — catches jam, empty ADF, stuck jobs
+    pre_check = check_scanner_before_scan()
+    if pre_check:
+        raise HTTPException(502, detail=pre_check)
+
     tmpdir = tempfile.mkdtemp(prefix="duplex_")
     pnms = scan_to_pnms(tmpdir, device=device, source="ADF",
                         mode=mode, resolution=resolution)
