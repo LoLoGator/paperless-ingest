@@ -1,0 +1,15 @@
+[Unit]
+Description=Paperless Ingest WebUI — upload & SANE-scan to Paperless-ngx consume dir
+Documentation=https://github.com/LoLoGator/paperless-ingest
+After=network.target
+
+[Service]
+Type=simple
+User=%(USER)s
+ExecStart=%(VENV_PYTHON)s /opt/paperless-ingest/paperless_ingest.py
+Restart=on-failure
+RestartSec=5
+WorkingDirectory=/opt/paperless-ingest
+
+[Install]
+WantedBy=multi-user.target
